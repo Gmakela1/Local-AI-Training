@@ -1,0 +1,97 @@
+#----------------INSTALLATIONS-------------------
+!pip uninstall -y cudf-cu12 pylibcudf-cu12 cudf
+!pip install -q transformers==4.34.1
+!pip install -q trl peft accelerate bitsandbytes datasets torch
+!pip install -U bitsandbytes
+
+
+#-------------------IMPORTS----------------------
+import os
+from google.colab import drive, files
+from datasets import Dataset, load_dataset
+from peft import LoraConfig, get_peft_model, PeftModel
+import torch, re, types, gc
+from trl import SFTTrainer
+from transformers import TrainingArguments, pipeline,A utoModelForCausalLM, AutoTokenizer
+from torch.utils.data import DataLoader
+
+#--------------SFT MODEL SETUP------------------
+####---DATA LOCATION----####
+drive.mount('/content/drive')
+data = load_dataset('json', data_files='/content/drive/MyDrive/Colab_Notebooks/Data/JSON_Q&As/Scrubbed/sft_data_clean.jsonl')
+sft_dataset = data['train']
+####---- LOAD MODELS ----####
+model_name = "Qwen/Qwen3-4B-Instruct-2507"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    device_map="auto",
+    load_in_8bit=True,
+    #tokenize=True,    #self added
+    trust_remote_code=True
+)
+
+lora_cfg = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+model = get_peft_model(model, lora_cfg)
+
+#----------------SFT TRAINING-------------------
+def fmt_sft(example):
+    messages = [
+        {"role": "system", "content": "You are a PySAM, electrical engineering, and microgrid engineering expert. Answer precisely and include code when relevant."},
+        {"role": "user", "content": example["instruction"]},
+        {"role": "assistant", "content": example["output"]}
+    ]
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+
+sft_args = TrainingArguments(
+    output_dir="/content/sft_out",
+    per_device_train_batch_size=1,           # ↓ from 4 → 1
+    gradient_accumulation_steps=16,          # ↑ 4× to keep effective batch = 16
+    num_train_epochs=4,
+    learning_rate=4e-5,
+    fp16=True,                               # ← Critical for T4
+    bf16=False,                              # T4 has no bf16
+    gradient_checkpointing=True,             # ← Saves ~50% VRAM
+    optim="paged_adamw_8bit",                # ← 8-bit optimizer
+    logging_steps=50,
+    save_steps=500,
+    save_total_limit=2,
+    report_to=[],
+    dataloader_num_workers=0,                # ← Avoid CPU OOM
+    dataloader_pin_memory=False,             # ← Reduce CPU→GPU copy
+    torch_compile=False,                     # ← Avoid OOM in compile
+)
+
+model.gradient_checkpointing_enable()
+model = get_peft_model(model, lora_cfg)
+
+sft_trainer = SFTTrainer(
+    model=model,
+    args=sft_args,
+    train_dataset=sft_dataset,
+    formatting_func=fmt_sft,
+)
+
+print("Starting SFT...")
+sft_trainer.train()
+sft_trainer.save_model("/content/drive/MyDrive/Colab_Notebooks/Model/sft_model")  # Saves LoRA adapter
+print("SFT done. Loading SFT model for RLVR...")
+
+#--------------SAVE MODEL-------------------
+final_model = ppo_trainer.model
+final_model.save_pretrained("/content/drive/MyDrive/Colab_Notebooks/Model/final_model")
+print("RLVR done. Model saved.")
+tokenizer.save_pretrained("/content/drive/MyDrive/Colab_Notebooks/Model/final_model")
+
+!zip -r /content/final_model.zip /content/final_model
+from google.colab import files
+files.download('/content/drive/MyDrive/Colab_Notebooks/Model/final_model.zip')
+print("Model downloaded!")
