@@ -1,0 +1,393 @@
+# ==============================
+#  PPO + Similarity RLVR – NO WARNINGS, LEFT-PADDED, LEARNING
+# ==============================
+
+!pip install -q torch transformers accelerate sentence-transformers matplotlib bitsandbytes peft
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset as TorchDataset, DataLoader
+import numpy as np
+import matplotlib.pyplot as plt
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from sentence_transformers import SentenceTransformer, util
+from peft import PeftModel
+import json
+import os
+from google.colab import drive, files
+
+# -------------------------------------------------
+# 0. Paths
+# -------------------------------------------------
+drive.mount('/content/drive')
+FINAL_ADAPTER_PATH = "/content/drive/MyDrive/Colab_Notebooks/Model/ppo_rlvr_adapter"
+DATA_PATH = '/content/drive/MyDrive/Colab_Notebooks/Data/JSON_Q&As/Scrubbed/rlvr_data_clean.jsonl'
+ADAPTER_PATH = "/content/drive/MyDrive/Colab_Notebooks/Model/sft_model"
+# -------------------------------------------------
+# 1. Data
+# -------------------------------------------------
+
+data = []
+with open(DATA_PATH, 'r', encoding='utf-8') as f:
+    for line in f:
+        if line.strip():
+            item = json.loads(line)
+            if 'prompt' in item and 'chosen' in item and 'rejected' in item:
+                data.append({
+                    "prompt": str(item["prompt"]).strip(),
+                    "chosen": str(item["chosen"]).strip(),
+                    "rejected": str(item["rejected"]).strip(),
+                })
+
+print(f"Loaded {len(data)} examples")
+
+# -------------------------------------------------
+# 2. Policy model selection + Tokenize Model
+# -------------------------------------------------
+BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+policy_tokenizer = AutoTokenizer.from_pretrained(
+    ADAPTER_PATH,
+    padding_side='left',
+    trust_remote_code=True
+)
+if policy_tokenizer.pad_token is None:
+    policy_tokenizer.pad_token = policy_tokenizer.eos_token
+    policy_tokenizer.pad_token_id = policy_tokenizer.eos_token_id
+
+print(f"Tokenizer loaded. Vocab size: {policy_tokenizer.vocab_size}")
+# -------------------------------------------------
+# 3. Similarity model
+# -------------------------------------------------
+sim_model = SentenceTransformer('all-MiniLM-L6-v2')
+sim_model.eval()
+
+
+# -------------------------------------------------
+# System Prompt
+# -------------------------------------------------
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": "You are a helpful and concise AI assistant. "
+               "always respond in 1-2 sentences, be conise and highly accurate. "
+               "Never say 'I don't know' — make an educated guess if needed."
+}
+
+# Apply chat template to add system prompt
+def apply_chat_template(prompt_text):
+    messages = [SYSTEM_PROMPT, {"role": "user", "content": prompt_text}]
+    return policy_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True  # adds <assistant> start
+    )
+# -------------------------------------------------
+# 4.2 Tokenize data
+# -------------------------------------------------
+tokenized = []
+for ex in data:
+    formatted_prompt = apply_chat_template(ex["prompt"])
+    
+    p = policy_tokenizer(ex["prompt"], truncation=True, max_length=64)["input_ids"]
+    c = policy_tokenizer(ex["chosen"], truncation=True, max_length=64)["input_ids"]
+    r = policy_tokenizer(ex["rejected"], truncation=True, max_length=64)["input_ids"]
+    tokenized.append({
+        "prompt_ids":   torch.tensor(p, dtype=torch.long),
+        "chosen_ids":   torch.tensor(c, dtype=torch.long),
+        "rejected_ids": torch.tensor(r, dtype=torch.long),
+        "chosen_text":  ex["chosen"],
+        "rejected_text":ex["rejected"],
+    })
+
+# -------------------------------------------------
+# 5. Dataset + LEFT-PAD collate
+# -------------------------------------------------
+class MyDataset(TorchDataset):
+    def __len__(self): return len(tokenized)
+    def __getitem__(self, i): return tokenized[i]
+
+def left_pad_collate(batch):
+    # Extract tensors first
+    prompts   = [b["prompt_ids"]   for b in batch]
+    chosens   = [b["chosen_ids"]   for b in batch]
+    rejecteds = [b["rejected_ids"] for b in batch]
+
+    def left_pad(seqs):
+        # Reverse → right-pad → reverse back
+        rev = [s.flip(0) for s in seqs]
+        padded = torch.nn.utils.rnn.pad_sequence(
+            rev, batch_first=True, padding_value=policy_tokenizer.pad_token_id
+        )
+        return padded.flip(-1)   # back to original order
+
+    return {
+        "prompt_ids":   left_pad(prompts),
+        "chosen_ids":   left_pad(chosens),
+        "rejected_ids": left_pad(rejecteds),
+        "chosen_text":  [b["chosen_text"]  for b in batch],
+        "rejected_text":[b["rejected_text"]for b in batch],
+    }
+
+dataset = MyDataset()
+
+# -------------------------------------------------
+# 6. Policy Actor
+# -------------------------------------------------
+class PPOActor(nn.Module):
+    def __init__(self, model_name, device):
+            super().__init__()
+            self.device = device
+
+            # ----- 4-bit quantization config -----
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+
+            # ----- Load BASE model in 4-bit -----
+            base_model = AutoModelForCausalLM.from_pretrained(
+                BASE_MODEL,
+                quantization_config=quantization_config,
+                device_map="auto",
+                trust_remote_code=True
+            )
+
+            # ----- Load YOUR LoRA adapter on top -----
+            self.model = PeftModel.from_pretrained(
+                base_model,
+                ADAPTER_PATH,                # your adapter folder
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+                is_trainable=True
+            )
+
+            self.pad_id = policy_tokenizer.pad_token_id
+            self.model.train()         
+            self.model.print_trainable_parameters()
+    def generate(self, input_ids, attention_mask=None, **kw):
+        kw.setdefault("pad_token_id", self.pad_id)
+        return self.model.generate(input_ids, attention_mask=attention_mask, **kw)
+
+    def get_logprobs(self, prompt_ids, response_ids, attention_mask):
+        """
+        prompt_ids      : [B, Lp]  (left-padded)
+        response_ids    : [B, Lr]  (left-padded)
+        attention_mask  : [B, Lp]  (1 for real tokens, 0 for pad)
+        """
+        B, Lp = prompt_ids.shape
+        Lr    = response_ids.shape[1]
+
+        # ------------------------------------------------------------------
+        # 1. Build the full sequence (prompt + response) and the full mask
+        # ------------------------------------------------------------------
+        full_ids  = torch.cat([prompt_ids, response_ids], dim=1)                # [B, Lp+Lr]
+        resp_mask = torch.ones(B, Lr, dtype=torch.long, device=self.device)     # response is always attended
+        full_attn = torch.cat([attention_mask, resp_mask], dim=1)               # [B, Lp+Lr]
+
+        # ------------------------------------------------------------------
+        # 2. Forward → logits → log-softmax
+        # ------------------------------------------------------------------
+        logits    = self.model(full_ids, attention_mask=full_attn).logits       # [B, Lp+Lr, V]
+        logp      = torch.log_softmax(logits[:, :-1, :], dim=-1)                # [B, Lp+Lr-1, V]
+        labels    = full_ids[:, 1:]                                            # [B, Lp+Lr-1]
+
+        # ------------------------------------------------------------------
+        # 3. Gather log-prob of the *chosen* token at each position
+        # ------------------------------------------------------------------
+        token_logp = torch.gather(logp, 2, labels.unsqueeze(-1)).squeeze(-1)    # [B, Lp+Lr-1]
+
+        # ------------------------------------------------------------------
+        # 4. Keep **only the response part** (after the prompt)
+        # ------------------------------------------------------------------
+        resp_start = Lp - 1                                 # first response token in shifted labels
+        resp_logp  = token_logp[:, resp_start:resp_start + Lr]   # [B, Lr]
+
+        # ------------------------------------------------------------------
+        # 5. Mask out padded response tokens (in case a response was truncated)
+        # ------------------------------------------------------------------
+        valid_resp = (response_ids != self.pad_id)          # [B, Lr]
+        resp_logp  = resp_logp.masked_fill(~valid_resp, 0.0)
+        n_tokens   = valid_resp.sum(dim=1).float().clamp(min=1.0)
+
+        return resp_logp.sum(dim=1) / n_tokens               # [B]
+
+# -------------------------------------------------
+# 7. Similarity
+# -------------------------------------------------
+INSTRUCTION_PREFIX = "INSTRUCTION: Be helpful, concise, and a tough but fair judge."
+
+def sim_score(a, b):
+    with torch.no_grad():
+        a_prefixed = INSTRUCTION_PREFIX + a
+        b_prefixed = INSTRUCTION_PREFIX + b
+        ea = sim_model.encode(a, convert_to_tensor=True)
+        eb = sim_model.encode(b, convert_to_tensor=True)
+        return util.cos_sim(ea, eb).item()
+
+# -------------------------------------------------
+# 8. Trainer
+# -------------------------------------------------
+class PPOTrainer:
+    def __init__(self, dataset, sim_weight=8.0, lr=5e-6, epochs=12, ppo_epochs=2, batch_size=4, kl_coef=0.05, entropy_coef=0.01, clip_range=0.2, target_kl=0.01, grad_accum_steps=2, use_flash_attention=True, fp16=True,):
+        self.dataset = dataset
+        self.sim_weight = sim_weight
+        self.epochs = epochs
+        self.ppo_epochs = ppo_epochs
+        self.batch_size = batch_size
+        self.kl_coef = kl_coef
+        self.entropy_coef = entropy_coef
+        self.clip_range = clip_range
+        self.target_kl = target_kl
+        self.grad_accum_steps = grad_accum_steps
+        self.use_flash_attention = use_flash_attention
+        self.fp16 = fp16
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy = PPOActor(ADAPTER_PATH, self.device)
+        self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=lr, weight_decay=1e-6)
+
+        self.scaler = torch.amp.GradScaler('cuda', enabled=fp16)
+
+    def train(self):
+        loader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True,
+                        collate_fn=left_pad_collate, pin_memory=True)
+        losses = []
+
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            self.optimizer.zero_grad()
+            for i, batch in enumerate(loader):
+                p = batch["prompt_ids"].to(self.device)
+                c = batch["chosen_ids"].to(self.device)
+                r = batch["rejected_ids"].to(self.device)
+                mask = (p != policy_tokenizer.pad_token_id).long()
+
+                # Generate
+                self.policy.eval()
+                with torch.no_grad():
+                    gen_out = self.policy.generate(p, attention_mask=mask,
+                                                  max_new_tokens=40,
+                                                  do_sample=True,
+                                                  top_p=0.9,
+                                                  temperature=0.6)
+                    gen_ids = gen_out[:, p.shape[1]:]
+                    gen_texts = [policy_tokenizer.decode(g, skip_special_tokens=True) for g in gen_ids]
+                self.policy.train()
+
+                # Compute OLD logprobs (frozen, no grad) ===
+                self.policy.eval()
+                with torch.no_grad():
+                    old_logp_c = self.policy.get_logprobs(p, c, mask)
+                    old_logp_r = self.policy.get_logprobs(p, r, mask)
+                self.policy.train()
+
+                # Similarity advantage
+                sim_c = torch.tensor([sim_score(g, ch) for g, ch in zip(gen_texts, batch["chosen_text"])], device=self.device)
+                sim_r = torch.tensor([sim_score(g, rej) for g, rej in zip(gen_texts, batch["rejected_text"])], device=self.device)
+                sim_adv = sim_c - sim_r
+
+                # Preference advantage (from old policy) ===
+                pref_adv = old_logp_c - old_logp_r
+                advantage = pref_adv + self.sim_weight * sim_adv
+                advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+                advantage = advantage.detach()
+
+                # === PPO (multiple epochs) ===
+                for _ in range(self.ppo_epochs):
+                    with torch.amp.autocast('cuda', enabled=self.fp16):
+                        logp_c = self.policy.get_logprobs(p, c, mask)
+                        ratio = torch.exp(logp_c - old_logp_c)
+
+                        # KL penalty
+                        kl = (old_logp_c - logp_c).mean()
+                        if kl > self.target_kl * 2:
+                            print(f"Early stopping at KL={kl:.4f}")
+                            break
+
+                        # Entropy (from logits)
+                        logits = self.policy.model(p).logits
+                        probs = torch.log_softmax(logits, dim=-1)
+                        entropy = -(probs * torch.exp(probs)).sum(dim=-1).mean()
+
+                        # Clipped loss
+                        s1 = ratio * advantage
+                        s2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * advantage
+                        ppo_loss = -torch.min(s1, s2).mean()
+                        loss = ppo_loss + self.kl_coef * kl - self.entropy_coef * entropy
+
+                    self.scaler.scale(loss / self.grad_accum_steps).backward()
+
+                    if (i + 1) % self.grad_accum_steps == 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.optimizer.zero_grad()
+
+                epoch_loss += loss.item()
+
+            avg = epoch_loss / len(loader)
+            losses.append(avg)
+            print(f"Epoch {epoch+1}/{self.epochs} – Loss: {avg:.5f}")
+
+        return losses
+
+# -------------------------------------------------
+# 9. Run
+# -------------------------------------------------
+trainer = PPOTrainer(
+    dataset,
+    sim_weight=9.0,
+    lr=1e-5,
+    epochs=8,
+    ppo_epochs=4,
+    batch_size=2,
+    kl_coef=0.05,
+    entropy_coef=0.01,
+    grad_accum_steps=4,
+    use_flash_attention=False,
+    fp16=True
+)
+print("Starting Similarity Judge training...")
+losses = trainer.train()
+
+# Plot
+plt.plot(losses)
+plt.title("Training Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.show()
+
+# -------------------------------------------------
+# 10. Test
+# -------------------------------------------------
+model = trainer.policy
+model.eval()
+prompt = "What is AI?"
+enc = policy_tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+ids = enc.input_ids.to(trainer.device)
+mask = enc.attention_mask.to(trainer.device)
+
+out = model.generate(ids, attention_mask=mask,
+                     max_new_tokens=40,
+                     do_sample=True,
+                     top_p=0.9,
+                     temperature=0.6)
+print("\nGenerated:")
+print(policy_tokenizer.decode(out[0], skip_special_tokens=True))
+
+# -------------------------------------------------
+# 11. Save
+# -------------------------------------------------
+trainer.policy.model.save_pretrained(FINAL_ADAPTER_PATH)
+policy_tokenizer.save_pretrained(FINAL_ADAPTER_PATH)
+
+print(f"RLVR done. LoRA adapter saved to: {FINAL_ADAPTER_PATH}")
+
+# Zip and download
+!zip -r /content/ppo_rlvr_adapter.zip "{FINAL_ADAPTER_PATH}"
+
+# Download to your local machine
+files.download('/content/ppo_rlvr_adapter.zip')
+print("Adapter downloaded! Ready for GGUF conversion.")
